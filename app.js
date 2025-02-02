@@ -143,7 +143,7 @@ const assistant = new Assistant({
             await client.conversations.join({ channel: threadContext.channel_id });
             channelHistory = await client.conversations.history({
               channel: threadContext.channel_id,
-              limit: 50,
+              limit: 10,
             });
           } else {
             logger.error(e);
