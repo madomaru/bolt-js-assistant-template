@@ -73,6 +73,12 @@ const assistant = new Assistant({
         });
       }
 
+      // 曖昧検索のサジェストプロンプト
+      prompts.push({
+        title: 'Fuzzy search',
+        message: 'Assistant, please perform a fuzzy search for the following term!',
+      });
+
       /**
        * Provide the user up to 4 optional, preset prompts to choose from.
        * The optional `title` prop serves as a label above the prompts. If
@@ -172,6 +178,123 @@ const assistant = new Assistant({
         await say({ text: llmResponse.choices[0].message.content });
 
         return;
+      }
+
+      // 曖昧検索が選択された場合
+      if (message.text.startsWith('Fuzzy search')) {
+        const parts = message.text.split(':');
+        if (parts.length < 2) {
+          await say("検索ワードを指定してください。例: Fuzzy search: 進捗報告");
+          return;
+        }
+        const query = parts[1].trim();
+        const prompt = `
+          ユーザーはSlackで「${query}」に関する過去のメッセージを探している。
+          この検索を助けるために、以下のような検索ワードのバリエーションを生成し、Slackのsearch.messagesメソッドで適切に活用できる形式で出力せよ。
+
+          - 「${query}」は単語かもしれませんし、文章（質問文）かもしれません。その意図を読み取り、適切な単語の同義語、略語、英語表記を考慮し、関連する検索ワードを生成する。
+          - Slackの検索演算子を適切に適用し、キーワードと組み合わせた検索クエリを作成する。
+          - 以下の検索演算子を考慮する：
+      
+            - OR を使うと、いずれかの単語を含むメッセージを検索できる。
+          - 検索演算子は不必要に使う必要はない。ユーザーの要求に合わせて適切に判断せよ
+          - 出力は「キーワードと検索演算子のみ」とし、説明文や番号を含めない。
+          - キーワードをスペース区切りで出力したものをクエリとし、各クエリをカンマ区切りで出力してください
+          - 検索ワードと検索演算子を組み合わせた具体的なクエリを10個以内で列挙せよ。
+          - ユーザーの要求に沿った結果が効率よく出るように、OR検索を使って適切に探せるようにしてください。OR検索を多用しすぎると、ユーザーの要求とは違う結果を拾ってしまうので、そこを考慮してください
+          - クエリの作成後、「${query}」について探せるクエリになっているかどうか、再評価して、最終的な出力をしてください
+
+          ### **期待する出力例**
+          videojs-overlay フルスクリーン from:@ItoMadoka  
+          videojs-overlay fullscreen in:#onboarding-itomado  
+          videojs-overlay フルスクリーン 検証 after:2024-01-01  
+          videojs-overlay fullscreen has:link
+          
+        `;
+
+        const llmResponseKeywords = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          n: 1,
+          messages: [
+            { role: 'system', content: DEFAULT_SYSTEM_CONTENT },
+            { role: 'user', content: prompt }
+          ]
+        });
+        const keywords = llmResponseKeywords.choices[0].message.content
+          .split(/[\n,]+/)
+          .map(k => k.trim())
+          .filter(k => k);
+        let allResults = [];
+        console.log("キーワード: ", keywords);
+        await say({ text: "キーワード" + keywords });
+        for (const keyword of keywords) {
+          try {
+            const userToken = process.env.SLACK_USER_TOKEN;
+            const searchResponse = await client.search.messages({ query: keyword, count: 20, token: userToken, search_exclude_bots: true });
+            if (searchResponse.messages && searchResponse.messages.matches) {
+              allResults = allResults.concat(searchResponse.messages.matches);
+              console.log("検索クエリ：", keyword);
+              // 成功した場合のログ出力を追加
+              logger.info(`検索成功: ${searchResponse.messages.matches.length} 件のメッセージが見つかりました。`);
+            } else {
+              // 検索結果が0件の場合のログ出力
+              logger.info('検索成功: 0 件のメッセージが見つかりました。');
+            }
+          } catch (error) {
+            logger.error(error);
+          }
+        }
+        if (allResults.length > 0) {
+          const evaluationPrompt = `
+            以下のメッセージリストから、クエリ「${query}」に最も関連する内容を選択し、それらのインデックスを関連性の高い順に列挙してください。重複する内容や関連性の低いメッセージは除外してください。出力はインデックスのみにしてください。Fuzzy search:という単語が含まれるものを除外してください
+            再度言いますが、内容が重複するものを除外してください。
+            クエリ: 「${query}」
+
+            メッセージリスト:
+            ${allResults.map((msg, index) => `${index + 1}: ${msg.text}`).join('\n')}
+
+            期待する出力形式:
+            1, 3, 5, ...
+          `;
+
+          const llmResponseEvaluation = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            n: 1,
+            messages: [
+              { role: 'system', content: DEFAULT_SYSTEM_CONTENT },
+              { role: 'user', content: evaluationPrompt }
+            ]
+          });
+          console.log("評価の回答: ", llmResponseEvaluation.choices[0].message.content);
+
+          // LLMによる評価結果を基に並び替えたメッセージリストを取得
+          const evaluatedIndexes = llmResponseEvaluation.choices[0].message.content
+            .split(',')
+            .map(index => parseInt(index.trim()) - 1) // インデックスを整数に変換し、1を引く
+            .filter(index => !isNaN(index) && index >= 0 && index < allResults.length);
+
+          // 評価結果に基づいて検索結果をフィルタリングし、並び替え、重複を排除
+          const uniqueResults = {};
+          evaluatedIndexes.forEach(index => {
+            const msg = allResults[index];
+            if (msg && !uniqueResults.hasOwnProperty(msg.permalink)) {
+              uniqueResults[msg.permalink] = msg;
+            }
+          });
+          const results = Object.values(uniqueResults).slice(0, 15);
+
+          if (results.length === 0) {
+            await say("該当するメッセージが見つかりませんでした。");
+            return;
+          }
+
+          // メッセージのリンクを表示
+          const responseText = results.map((msg, idx) =>
+            `${idx + 1}. ${msg.text.substring(0, 30)}… → <${msg.permalink}|リンク>`
+          ).join('\n');
+          await say({ text: responseText });
+          return;
+        }
       }
 
       /**
